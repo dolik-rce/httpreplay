@@ -65,10 +65,7 @@ class AsyncHTTPRequest(asynchat.async_chat):
         self.set_terminator(b'\r\n\r\n')
 
         # get request data from feeder
-        request = self.manager.feeder.get_request()
-        if request is None:
-            raise NoDataException()
-        request = ensure_bytes(request)
+        request = ensure_bytes(self.manager.feeder.get_request())
         # pass request to consumer, for logging purposes
         self.consumer.set_request(request)
 
@@ -253,7 +250,7 @@ class FileFeeder(BaseFeeder):
         while True:
             line = self.f.readline()
             if line == "":
-                return None
+                raise NoDataException
             for cmd in HTTP_METHODS:
                 if line.startswith(cmd):
                     return line
@@ -263,13 +260,11 @@ class FileFeeder(BaseFeeder):
         Reads all headers, returns the data read and content-length if present
         """
         headers = self._find_start()
-        if headers is None:
-            return None, None
         length = 0
         while True:
             line = self.f.readline().rstrip("\r\n")
             if line is None:
-                return None, None
+                raise NoDataException
             headers += line + "\r\n"
             if line.lower().startswith("content-length:"):
                 length = int(line[16:])
@@ -280,8 +275,6 @@ class FileFeeder(BaseFeeder):
     def get_request(self):
         """ Returns one request read from file """
         req, length = self._read_headers()
-        if req is None:
-            return None
         req += self.f.read(length)
         return req
 
