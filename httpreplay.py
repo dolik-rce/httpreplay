@@ -307,17 +307,27 @@ class PrintConsumer(BaseConsumer):
 
     def set_request(self, data):
         """ Stores request data and adds captions. """
-        self.data.append(b'== REQUEST %s ==\n' % datetime.now())
-        self.data.append(b'%s== RESPONSE ==\n' % data)
+        self.data.extend([
+            b'== REQUEST ',
+            ensure_bytes(str(datetime.now())),
+            b' ==\n',
+            data,
+            b'== RESPONSE ==\n'])
 
     def feed(self, data):
         """ Stores the received data. """
         self.data.append(data)
 
+    def _finished(self):
+        self.data.extend([
+            b'== FINISHED ',
+            ensure_bytes(str(datetime.now())),
+            b' =='])
+
     def close(self):
         """ Prints all the data collected so far and end caption. """
-        self.data.append(b'== FINISHED %s ==' % datetime.now())
-        print(''.join(self.data))
+        self._finished()
+        print(ensure_string(b''.join(self.data)))
 
 
 def FileConsumer(filename):
@@ -333,7 +343,7 @@ def FileConsumer(filename):
         """
         def close(self):
             """ Prints collected data to file """
-            self.data.append(b'== FINISHED %s ==' % datetime.now())
+            self._finished()
             with open(filename, 'ab') as f:
                 [f.write(d) for d in self.data]
     f = open(filename, 'w')
