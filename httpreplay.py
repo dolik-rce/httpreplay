@@ -12,51 +12,75 @@ CHUNKED = object()
 CHUNK = object()
 BODY = object()
 
+HTTP_METHODS = set(["GET", "POST", "HEAD", "PUT", "DELETE",
+                    "OPTIONS", "TRACE", "CONNECT"])
+
 
 def ensure_string(data):
+    """ Utility function to convert bytes to string when neccessary """
     if isinstance(data, bytes):
         return data.decode()
     return data
 
 
 def ensure_bytes(data):
+    """ Utility function to convert string to bytes when neccessary """
     if isinstance(data, str):
         return data.encode()
     return data
 
 
 class NoDataException(Exception):
+    """ Exception signaling that no more requests are available """
     pass
 
 
 class AsyncHTTPRequest(asynchat.async_chat):
+    """
+    Class for handling HTTP(S) request asynchronously.
+    Both fixed content-length and chunked encoding are supported. Request data
+    is read from consumer suplied by RequestManager and the response is
+    passed to the feeder, also supplied by RequestManager.
+    """
+
     state = HEADER
     response = None
     established = False
     want_read = True
     want_write = True
 
-    def __init__(self, manager, seq):
+    def __init__(self, manager, slot=0):
+        """
+        Params:
+            manager     should be instance of RequestManager
+            slot        integer designating slot when using parallel execution,
+                        this is only stored and passed back to RequestManager
+                        after the response is received
+        """
+        asynchat.async_chat.__init__(self)
         self.last_read = time.time()
         self.manager = manager
         self.consumer = manager.consumer_type()
-        self.seq = seq
+        self.slot = slot
         self.set_terminator(b'\r\n\r\n')
 
+        # get request data from feeder
         request = self.manager.feeder.get_request()
         if request is None:
             raise NoDataException()
         request = ensure_bytes(request)
-        self.established = not self.manager.https
+        # pass request to consumer, for logging purposes
         self.consumer.set_request(request)
 
-        asynchat.async_chat.__init__(self)
+        # prepare the request for sending
         self.push(request)
         # connect to the host asynchronously
+        self.established = not self.manager.https
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connect((self.manager.host, self.manager.port))
 
     def collect_incoming_data(self, data):
+        """ Called by asyncore when terminator is found """
         self.last_read = time.time()
         if self.state is HEADER or self.state is CHUNKED:
             self.incoming.append(data)
@@ -64,6 +88,7 @@ class AsyncHTTPRequest(asynchat.async_chat):
             self.consumer.feed(data)
 
     def _find_header(self, name, default, headers):
+        """ Finds header in string and return its value """
         p = headers.find(name)
         if p < 0:
             return default
@@ -72,8 +97,10 @@ class AsyncHTTPRequest(asynchat.async_chat):
         return headers[s:e].rstrip("\r\n").lower()
 
     def found_terminator(self):
+        """ Called by asyncore when terminator is found """
         self.last_read = time.time()
         if self.state is HEADER:
+            # reading headers
             self.state = BODY
             headers = self._get_data().rstrip() + b'\r\n\r\n'
             self.consumer.feed(headers)
@@ -89,6 +116,7 @@ class AsyncHTTPRequest(asynchat.async_chat):
                 self.set_terminator(length)
 
         elif self.state is CHUNKED:
+            # reading chunked response
             ch = ensure_string(self._get_data()).rstrip().partition(';')[0]
             if not ch:
                 # it's probably the spare \r\n between chunks...
@@ -112,19 +140,22 @@ class AsyncHTTPRequest(asynchat.async_chat):
             self.handle_close()
 
     def handle_close(self):
+        """ Called by asyncore when socket is closed """
         if self.manager.https:
             self.socket = self._socket
         asynchat.async_chat.handle_close(self)
         try:
-            self.manager.add_channel(self.seq)
+            # this request is done, tell RequestManager new one can be spawned
+            self.manager.add_channel(self.slot)
         except NoDataException:
             pass
 
-    # https support
     def readable(self):
+        """ Called by asyncore to determine if we're ready to read """
         return self.want_read and asynchat.async_chat.readable(self)
 
     def writable(self):
+        """ Called by asyncore to determine if we're ready to write """
         if time.time() - self.last_read > self.manager.timeout:
             # should signal timeout here
             self.state = BODY
@@ -133,6 +164,7 @@ class AsyncHTTPRequest(asynchat.async_chat):
         return self.want_write and asynchat.async_chat.writable(self)
 
     def _handshake(self):
+        """ Performs ssl handshake when HTTPS protocol is used """
         try:
             self.socket.do_handshake()
         except ssl.SSLError as err:
@@ -149,19 +181,21 @@ class AsyncHTTPRequest(asynchat.async_chat):
             self.established = True
 
     def handle_write(self):
+        """ Called by asyncore when socket is ready for writing """
         if self.established:
             return self.initiate_send()
-
         self._handshake()
 
     def handle_read(self):
+        """ Called by asyncore when socket is ready for reading """
         if self.established:
             return asynchat.async_chat.handle_read(self)
-
         self._handshake()
 
     def handle_connect(self):
+        """ Called by asyncore when socket is really opened """
         if self.manager.https:
+            # we replace regular socket with ssl socket
             self._socket = self.socket
             self.socket = ssl.wrap_socket(
                 self._socket,
@@ -169,16 +203,31 @@ class AsyncHTTPRequest(asynchat.async_chat):
 
 
 class BaseFeeder(object):
+    """
+    Base class for feeders. Only method that must be implemented by inheriting
+    classes is get_request()
+    """
     def get_request(self):
+        """ Should return request data or raise NoDataException """
         raise NotImplementedError()
 
 
 class SimpleFeeder(BaseFeeder):
+    """
+    Basic implementation of feeder, repeats the same request
+    for specified amount of times.
+    """
     def __init__(self, request, count):
+        """
+        Params:
+            request     Request data, must end with '\r\n\r\n'
+            count       How many times to repeat the request
+        """
         self.counter = count
         self.request = request
 
     def get_request(self):
+        """ Returns the request data as many times as requested in __init__ """
         if self.counter > 0:
             self.counter -= 1
             return self.request
@@ -186,19 +235,33 @@ class SimpleFeeder(BaseFeeder):
 
 
 class FileFeeder(BaseFeeder):
+    """
+    Feeder implementation that reads the request from specified file.
+    The requests in file should with 'GET', 'POST', etc. and be terminated
+    by '\n\n' or '\r\n\r\n' (line endings style doesn't matter). Additional
+    data between requests are ignored.
+    """
     def __init__(self, filename="/dev/stdin"):
+        """
+        Params:
+            filename    File to read, defaults to standard input
+        """
         self.f = open(filename, 'r')
 
     def _find_start(self):
+        """ Searches file for beginning of next request """
         while True:
             line = self.f.readline()
             if line == "":
                 return None
-            for cmd in ("GET", "POST", "HEAD", "PUT"):
+            for cmd in HTTP_METHODS:
                 if line.startswith(cmd):
                     return line
 
     def _read_headers(self):
+        """
+        Reads all headers, returns the data read and content-length if present
+        """
         headers = self._find_start()
         if headers is None:
             return None, None
@@ -215,6 +278,7 @@ class FileFeeder(BaseFeeder):
         return headers, length
 
     def get_request(self):
+        """ Returns one request read from file """
         req, length = self._read_headers()
         if req is None:
             return None
@@ -223,35 +287,60 @@ class FileFeeder(BaseFeeder):
 
 
 class BaseConsumer(object):
+    """
+    Base class for consumers. Only method that must be implemented
+    by inheriting classes is feed().
+    """
     def set_request(self, data):
+        """ Called as soon as request is read from feeder. """
         pass
 
     def feed(self, data):
+        """ Called to pass parts of response data as they arrive. """
         raise NotImplementedError()
 
     def close(self):
+        """ Called after entire response is received. """
         pass
 
 
 class PrintConsumer(BaseConsumer):
+    """
+    Simple implementation of consumer that caches the request and response data
+    and prints them to standard output when they are complete.
+    """
     def __init__(self):
         self.data = []
 
     def set_request(self, data):
+        """ Stores request data and adds captions. """
         self.data.append(b'== REQUEST %s ==\n' % datetime.now())
         self.data.append(b'%s== RESPONSE ==\n' % data)
 
     def feed(self, data):
+        """ Stores the received data. """
         self.data.append(data)
 
     def close(self):
+        """ Prints all the data collected so far and end caption. """
         self.data.append(b'== FINISHED %s ==' % datetime.now())
         print(''.join(self.data))
 
 
 def FileConsumer(filename):
+    """
+    Factory function returning consumer class with preset filename to
+    write into. Also, the file is truncated when called, to assure it can be
+    accessed and to scrape results from previous runs.
+    """
     class _FileConsumer(PrintConsumer):
+        """
+        Slight modification of PrintConsumer that appends the data into
+        a file instead of standard output.
+        """
         def close(self):
+            """ Prints collected data to file """
+            self.data.append(b'== FINISHED %s ==' % datetime.now())
             with open(filename, 'ab') as f:
                 [f.write(d) for d in self.data]
     f = open(filename, 'w')
@@ -260,31 +349,49 @@ def FileConsumer(filename):
 
 
 class DummyConsumer(BaseConsumer):
+    """ Consumer implementation that simply discards all data it recieves. """
     def feed(self, data):
         pass
 
 
 class RequestManager(object):
+    """
+    Class managing creation of requests. Contains all neccessary information,
+    including feeder and consumer.
+    """
     def __init__(self, feeder, consumer_type=DummyConsumer, host='localhost',
                  port=80, parallel=1, https=False, timeout=30):
+        """
+        Params:
+            feeder          Instance of BaseFeeder inherited class
+            consumer_type   Type of consumer (new one is constructed for
+                            each request)
+            host            Hostname or IP address of remote end
+            port            Port to talk to
+            parallel        How many request should be used at any given moment
+            https           Whether to use https or http
+            timeout         How long to wait for reply
+        """
         self.feeder = feeder
         self.consumer_type = consumer_type
         self.host = host
         self.port = port
         self.https = https
         self.timeout = timeout
-        self._prepare_queue(parallel)
+        self._prepare_requests(parallel)
 
-    def _prepare_queue(self, parallel):
-        self.queue = [None] * parallel
+    def _prepare_requests(self, count):
+        """ Creates given number of requests """
+        self.slots = [None] * count
         try:
-            for i in range(parallel):
+            for i in range(count):
                 self.add_channel(i)
         except NoDataException:
             pass
 
-    def add_channel(self, seq):
-        self.queue[seq] = AsyncHTTPRequest(self, seq)
+    def add_channel(self, slot):
+        """ Replaces finished request in given slot by a new one """
+        self.slots[slot] = AsyncHTTPRequest(self, slot)
 
 
 def main():
