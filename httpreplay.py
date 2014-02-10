@@ -168,14 +168,6 @@ class AsyncHTTPRequest(asynchat.async_chat):
                 do_handshake_on_connect=False)
 
 
-def log(msg, data=""):
-    return "== %s (%s) == %s%s" % (
-        msg,
-        datetime.now(),
-        '\n' if data != "" else "",
-        data)
-
-
 class BaseFeeder(object):
     def get_request(self):
         raise NotImplementedError()
@@ -244,17 +236,16 @@ class BaseConsumer(object):
 class PrintConsumer(BaseConsumer):
     def __init__(self):
         self.data = []
-        self._request = ''
 
     def set_request(self, data):
-        self._request = log("REQUEST", ensure_string(data))
+        self.data.append(b'== REQUEST %s ==\n' % datetime.now())
+        self.data.append(b'%s== RESPONSE ==\n' % data)
 
     def feed(self, data):
         self.data.append(data)
 
     def close(self):
-        print(self._request)
-        print(log("RESPONSE"))
+        self.data.append(b'== FINISHED %s ==' % datetime.now())
         print(''.join(self.data))
 
 
@@ -262,9 +253,6 @@ def FileConsumer(filename):
     class _FileConsumer(PrintConsumer):
         def close(self):
             with open(filename, 'ab') as f:
-                f.write(ensure_bytes("%s\n%s\n" % (
-                    self._request,
-                    log("RESPONSE"))))
                 [f.write(d) for d in self.data]
     f = open(filename, 'w')
     f.close()
@@ -300,7 +288,7 @@ class RequestManager(object):
 
 
 def main():
-    print(log("START"))
+    print("== START ==")
     RequestManager(
         FileFeeder("/tmp/test"),
         FileConsumer('/tmp/szn'),
@@ -308,11 +296,11 @@ def main():
         parallel=10)
     RequestManager(
         SimpleFeeder("GET / HTTP/1.1\r\nHost: google.com\r\n\r\n", 100),
-        FileConsumer('/tmp/ggl'),
+        PrintConsumer,
         host="google.cz",
         parallel=10)
     asyncore.loop(timeout=.25)
-    print(log("DONE"))
+    print("== DONE ==")
 
 if __name__ == '__main__':
     main()
